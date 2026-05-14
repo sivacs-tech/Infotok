@@ -1,55 +1,110 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from app.models.domain import Interaction, Reel
 import random
 from typing import List
 
-def get_for_you_feed(db: Session, user_id: str) -> List[Reel]:
-    # 1. Fetch user's interactions
-    interactions = db.query(Interaction).filter(Interaction.user_id == user_id).all()
-    
-    # 2. Calculate hashtag frequencies and weight interactions
-    hashtag_scores = {}
-    for inter in interactions:
-        weight = 1
-        if inter.interaction_type == 'like':
-            weight = 5
-        elif inter.interaction_type == 'share':
-            weight = 10
-        elif inter.interaction_type == 'view_time' and inter.view_time_ms:
-            # 1 point per second of view time, max 10 points
-            weight = min(inter.view_time_ms // 1000, 10)
-            
-        if inter.hashtags_involved:
-            for tag in inter.hashtags_involved:
-                hashtag_scores[tag] = hashtag_scores.get(tag, 0) + weight
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
-    # Extract the top 5 most engaged hashtags
-    top_hashtags = sorted(hashtag_scores.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_tags = [tag for tag, score in top_hashtags]
-    
-    # 3. Fetch 15 related reels matching these exact hashtags
-    related_reels = []
-    if top_tags:
-        # Fetching recent reels to filter matches
-        recent_reels = db.query(Reel).order_by(Reel.created_at.desc()).limit(200).all()
-        scored_reels = []
-        for r in recent_reels:
-            if not r.hashtags: continue
-            overlap = set(r.hashtags).intersection(set(top_tags))
-            if overlap:
-                scored_reels.append(r)
-        
-        random.shuffle(scored_reels)
-        related_reels = scored_reels[:15]
-    
-    # 4. Fetch 5 random/trending reels outside their filter bubble
-    related_ids = [r.id for r in related_reels]
-    random_reels = db.query(Reel).filter(
-        ~Reel.id.in_(related_ids) if related_ids else True
-    ).order_by(func.random()).limit(5).all()
-    
-    # 5. Assemble and shuffle the final feed
-    feed = related_reels + random_reels
-    random.shuffle(feed)
-    return feed
+from app.models.domain import Block, Follow, Interaction, Like, Reel
+
+
+def _blocked_author_ids(db: Session, user_id: str) -> list[str]:
+    return [
+        block.blocked_id
+        for block in db.query(Block).filter(Block.blocker_id == user_id).all()
+    ]
+
+
+def _base_visible_reels(db: Session, user_id: str):
+    query = db.query(Reel).filter(Reel.is_deleted == False)  # noqa: E712
+    blocked_ids = _blocked_author_ids(db, user_id)
+    if blocked_ids:
+        query = query.filter(~Reel.author_id.in_(blocked_ids))
+    return query
+
+
+def get_for_you_feed(
+    db: Session,
+    user_id: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> List[Reel]:
+    interactions = (
+        db.query(Interaction).filter(Interaction.user_id == user_id).limit(500).all()
+    )
+
+    hashtag_scores: dict[str, int] = {}
+    for interaction in interactions:
+        weight = 1
+        if interaction.interaction_type == "like":
+            weight = 5
+        elif interaction.interaction_type == "comment":
+            weight = 7
+        elif interaction.interaction_type == "share":
+            weight = 10
+        elif interaction.interaction_type == "view_time" and interaction.view_time_ms:
+            weight = min(interaction.view_time_ms // 1000, 10)
+
+        for tag in interaction.hashtags_involved or []:
+            hashtag_scores[tag] = hashtag_scores.get(tag, 0) + weight
+
+    top_tags = [
+        tag
+        for tag, _score in sorted(
+            hashtag_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:6]
+    ]
+
+    offset = max(page - 1, 0) * page_size
+    recent_reels = (
+        _base_visible_reels(db, user_id)
+        .order_by(Reel.created_at.desc())
+        .offset(offset)
+        .limit(200)
+        .all()
+    )
+
+    if not recent_reels:
+        return []
+
+    scored: list[tuple[int, Reel]] = []
+    following_ids = {
+        follow.following_id
+        for follow in db.query(Follow).filter(Follow.follower_id == user_id).all()
+    }
+    seen_reel_ids = {
+        interaction.reel_id
+        for interaction in interactions
+        if interaction.interaction_type in {"like", "comment", "view_time"}
+    }
+
+    for reel in recent_reels:
+        score = 1
+        tags = set(reel.hashtags or [])
+        score += len(tags.intersection(top_tags)) * 8
+        if reel.author_id in following_ids:
+            score += 5
+        if reel.id in seen_reel_ids:
+            score -= 3
+        score += db.query(Like).filter(Like.reel_id == reel.id).count() * 2
+        scored.append((score, reel))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_slice = [reel for _score, reel in scored[: page_size * 2]]
+    random.shuffle(top_slice)
+    return top_slice[:page_size]
+
+
+def get_trending_reels(db: Session, page: int = 1, page_size: int = 20) -> List[Reel]:
+    offset = max(page - 1, 0) * page_size
+    return (
+        db.query(Reel)
+        .outerjoin(Like, Like.reel_id == Reel.id)
+        .filter(Reel.is_deleted == False)  # noqa: E712
+        .group_by(Reel.id)
+        .order_by(func.count(Like.id).desc(), Reel.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+        .all()
+    )
