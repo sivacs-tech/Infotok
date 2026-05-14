@@ -6,12 +6,13 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api import interactions, media, reels, users
 from app.core.config import settings
-from app.core.database import Base, SessionLocal, engine
+from app.core.database import SessionLocal, engine
+from app.core.schema import ensure_database_schema
 from app.services.seed import seed_database
 
 os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
 
-Base.metadata.create_all(bind=engine)
+ensure_database_schema(engine)
 
 with SessionLocal() as db:
     seed_database(db)
